@@ -464,7 +464,7 @@ std::string OpenXR::get_result_string(XrResult result) const {
     std::string result_string{};
     result_string.resize(XR_MAX_RESULT_STRING_SIZE);
     xrResultToString(this->instance, result, result_string.data());
-
+    result_string.resize(strnlen(result_string.c_str(), XR_MAX_RESULT_STRING_SIZE));
     return result_string;
 }
 
@@ -472,7 +472,7 @@ std::string OpenXR::get_structure_string(XrStructureType type) const {
     std::string structure_string{};
     structure_string.resize(XR_MAX_STRUCTURE_NAME_SIZE);
     xrStructureTypeToString(this->instance, type, structure_string.data());
-
+    structure_string.resize(strnlen(structure_string.c_str(), XR_MAX_STRUCTURE_NAME_SIZE));
     return structure_string;
 }
 

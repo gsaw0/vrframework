@@ -1,5 +1,11 @@
 #ifndef STREAMLINE_LEGACY
 #include "UpscalerAfrNvidiaModule.h"
+#include <atomic>
+
+static std::atomic<bool>     s_dlss_options_reset{true};
+static std::atomic<uint64_t> s_dlss_stable_wh{0}; // high32=width, low32=height
+
+
 #ifdef _DEBUG
 #include <nvidia/ShaderDebugOverlay.h>
 #endif
@@ -44,6 +50,7 @@ void UpscalerAfrNvidiaModule::on_config_save(utility::Config& cfg)
 
 void UpscalerAfrNvidiaModule::on_device_reset()
 {
+    s_dlss_options_reset = true;
 #ifdef MOTION_VECTOR_REPROJECTION
     m_motion_vector_reprojection.on_device_reset();
 #endif
@@ -201,14 +208,12 @@ sl::Result UpscalerAfrNvidiaModule::on_slSetTag(sl::ViewportHandle& viewport, co
     static auto            instance    = UpscalerAfrNvidiaModule::Get();
     static auto            original_fn = instance->m_set_tag_hook->get_original<decltype(UpscalerAfrNvidiaModule::on_slSetTag)>();
     static auto            vr          = VR::get();
-    // spdlog::error("UNEXPECTED CALL TO slSetTag");
-    // exit(1);
     if(vr->m_render_frame_count % 2 == 0 && instance->m_enabled->value()) {
         sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
         return original_fn(afr_viewport_handle, tags, numTags, cmdBuffer);
     }
-    auto result = original_fn(viewport, tags, numTags, cmdBuffer);
-    return result;
+    sl::ViewportHandle stable_viewport{0u};
+    return original_fn(stable_viewport, tags, numTags, cmdBuffer);
 }
 
 namespace {
@@ -221,6 +226,7 @@ namespace {
 #endif
         return feature == sl::kFeatureDLSS;
     }
+
 }
 
 sl::Result UpscalerAfrNvidiaModule::on_slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame, sl::BaseStructure** inputs, uint32_t numInputs, sl::CommandBuffer* cmdBuffer)
@@ -260,22 +266,17 @@ sl::Result UpscalerAfrNvidiaModule::on_slEvaluateFeature(sl::Feature feature, co
     }
 #endif
 
-    if(frame % 2 == 0 && supported_afr_feature(feature) && instance->m_enabled->value()) {
-        sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
-        std::vector<sl::BaseStructure*> afr_inputs{};
-        afr_inputs.resize(numInputs);
-        //TODO  viewport is always at index 0
+    if(supported_afr_feature(feature)) {
+        sl::ViewportHandle target_viewport = (frame % 2 == 0 && instance->m_enabled->value())
+            ? sl::ViewportHandle{instance->m_afr_viewport_id}
+            : sl::ViewportHandle{0u};
+        std::vector<sl::BaseStructure*> remapped_inputs(numInputs);
         for (uint32_t i = 0; i < numInputs; i++) {
-            if (inputs[i]->structType == sl::ViewportHandle::s_structType) {
-                afr_inputs[i] = &afr_viewport_handle;
-            } else {
-                afr_inputs[i] = inputs[i];
-            }
+            remapped_inputs[i] = (inputs[i]->structType == sl::ViewportHandle::s_structType) ? &target_viewport : inputs[i];
         }
-        return original_fn(feature, frame, afr_inputs.data(), numInputs, cmdBuffer);
+        return original_fn(feature, frame, remapped_inputs.data(), numInputs, cmdBuffer);
     }
-    auto result = original_fn(feature, frame, inputs, numInputs, cmdBuffer);
-    return result;
+    return original_fn(feature, frame, inputs, numInputs, cmdBuffer);
 }
 
 // TODO vr->get_current_render_eye() == VRRuntime::Eye::RIGHT in real is left eye texture
@@ -299,8 +300,8 @@ sl::Result UpscalerAfrNvidiaModule::on_slSetConstants(sl::Constants& values, con
         sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
         return original_fn(values, frame, afr_viewport_handle);
     }
-    auto result = original_fn(values, frame, viewport);
-    return result;
+    sl::ViewportHandle stable_viewport{0u};
+    return original_fn(values, frame, stable_viewport);
 }
 
 //sl::Result UpscalerAfrNvidiaModule::on_slDVCSetOptions(const sl::ViewportHandle &viewport, const sl::DeepDVCOptions &options) {
@@ -327,24 +328,35 @@ sl::Result UpscalerAfrNvidiaModule::on_dlssrrSetOptions(const sl::ViewportHandle
 
 sl::Result UpscalerAfrNvidiaModule::on_dlssSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSOptions& options)
 {
-    static auto     instance         = UpscalerAfrNvidiaModule::Get();
-    static auto     original_fn      = instance->m_dlss_set_options_hook->get_original<decltype(UpscalerAfrNvidiaModule::on_dlssSetOptions)>();
+    static auto instance    = UpscalerAfrNvidiaModule::Get();
+    static auto original_fn = instance->m_dlss_set_options_hook->get_original<decltype(UpscalerAfrNvidiaModule::on_dlssSetOptions)>();
+    if(options.mode == sl::DLSSMode::eOff) {
+        spdlog::info("slDLSSSetOptions eOff suppressed for viewport {:x}", (UINT)viewport);
+        return sl::Result::eOk;
+    }
+    const uint64_t new_wh = (uint64_t(options.outputWidth) << 32) | uint64_t(options.outputHeight);
+    const bool     needs_reset = s_dlss_options_reset.exchange(false);
+    const uint64_t old_wh     = s_dlss_stable_wh.exchange(new_wh);
+    if(!needs_reset && old_wh == new_wh) {
+        return sl::Result::eOk;
+    }
+    spdlog::info("slDLSSSetOptions APPLYING viewport {:x} mode {} output {}x{}", (UINT)viewport, (int)options.mode, options.outputWidth, options.outputHeight);
     if(instance->m_enabled->value()) {
         sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
         original_fn(afr_viewport_handle, options);
     }
-    return original_fn(viewport, options);
+    sl::ViewportHandle stable_viewport{0u};
+    return original_fn(stable_viewport, options);
 }
 
 sl::Result UpscalerAfrNvidiaModule::on_slFreeResources(sl::Feature feature, const sl::ViewportHandle& viewport)
 {
     static auto instance    = UpscalerAfrNvidiaModule::Get();
     static auto original_fn = instance->m_free_resources_hook->get_original<decltype(UpscalerAfrNvidiaModule::on_slFreeResources)>();
-    if(supported_afr_feature(feature) && instance->m_enabled->value()) {
-        sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
-        original_fn(feature, afr_viewport_handle);
+    if(supported_afr_feature(feature)) {
+        spdlog::info("slFreeResources suppressed for feature {:x} viewport {:x}", (UINT)feature, (UINT)viewport);
+        return sl::Result::eOk;
     }
-    spdlog::info("slFreeResources called for feature {:x} viewport {:x}", (UINT)feature, (UINT)viewport);
     return original_fn(feature, viewport);
 }
 
@@ -356,7 +368,11 @@ sl::Result UpscalerAfrNvidiaModule::on_slAllocateResources(sl::CommandBuffer* cm
         sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
         original_fn(cmdBuffer, feature, afr_viewport_handle);
     }
-    spdlog::info("slAllocateResources called for feature {:x} viewport {:x}", (UINT)feature, (UINT)viewport);
+    spdlog::info("slAllocateResources for feature {:x} viewport {:x}", (UINT)feature, (UINT)viewport);
+    if(supported_afr_feature(feature)) {
+        sl::ViewportHandle stable_viewport{0u};
+        return original_fn(cmdBuffer, feature, stable_viewport);
+    }
     return original_fn(cmdBuffer, feature, viewport);
 }
 #endif

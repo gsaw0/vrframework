@@ -150,12 +150,11 @@ Framework::Framework(HMODULE module)
     , m_game_module{GetModuleHandle(0)}
     {
 
-#ifndef _DEBUG
-    // Use null logger if possible
+#if defined(_DEBUG) || defined(ENABLE_FILE_LOGGING)
+    m_logger = spdlog::basic_logger_mt("VRFramework", (get_persistent_dir("vr_log.txt")).string(), true);
+#else
     auto null_sink = std::make_shared<spdlog::sinks::null_sink_mt>();
     m_logger = std::make_shared<spdlog::logger>("null_logger", null_sink);
-#else
-    m_logger = spdlog::basic_logger_mt("VRFramework", (get_persistent_dir("vr_log.txt")).string(), true);
 #endif
 
     std::scoped_lock __{m_startup_mutex};
