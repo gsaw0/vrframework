@@ -331,7 +331,7 @@ sl::Result UpscalerAfrNvidiaModule::on_dlssSetOptions(const sl::ViewportHandle& 
     static auto instance    = UpscalerAfrNvidiaModule::Get();
     static auto original_fn = instance->m_dlss_set_options_hook->get_original<decltype(UpscalerAfrNvidiaModule::on_dlssSetOptions)>();
     if(options.mode == sl::DLSSMode::eOff) {
-        spdlog::info("slDLSSSetOptions eOff suppressed for viewport {:x}", (UINT)viewport);
+        spdlog::debug("slDLSSSetOptions eOff suppressed for viewport {:x}", (UINT)viewport);
         return sl::Result::eOk;
     }
     const uint64_t new_wh = (uint64_t(options.outputWidth) << 32) | uint64_t(options.outputHeight);

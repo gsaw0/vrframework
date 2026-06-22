@@ -201,8 +201,6 @@ bool ShaderDebugOverlay::ValidateResource(ID3D12Resource* source, ComPtr<ID3D12R
     if (buffers[0] != nullptr) {
         D3D12_RESOURCE_DESC desc2 = buffers[0]->GetDesc();
         if (desc.Width != desc2.Width || desc.Height != desc2.Height || desc.Format != desc2.Format) {
-            spdlog::info("Resource size mismatch {} {} {} {} {} {} {} {}", fmt::ptr(source), desc.Width, desc.Height, desc.Format, fmt::ptr(buffers[0].Get()), desc2.Width,
-                         desc2.Height, desc2.Format);
             buffers[0].Reset();
             buffers[1].Reset();
         }
