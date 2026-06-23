@@ -341,6 +341,23 @@ sl::Result UpscalerAfrNvidiaModule::on_dlssSetOptions(const sl::ViewportHandle& 
         return sl::Result::eOk;
     }
     spdlog::info("slDLSSSetOptions APPLYING viewport {:x} mode {} output {}x{}", (UINT)viewport, (int)options.mode, options.outputWidth, options.outputHeight);
+
+    // The game reconfigures DLSS to a different output resolution on menu/StarMap transitions, each time
+    // with a fresh viewport handle that we remap onto the shared viewports 0 and m_afr_viewport_id. Because
+    // on_slFreeResources suppresses the game's cleanup for these shared viewports, Streamline would keep the
+    // previous resolution's internal buffers resident -> VRAM accumulates until it overcommits. Release the
+    // stale resources for the shared viewports before reconfiguring at the new resolution. Only runs on an
+    // actual resolution change, so normal gameplay (stable resolution) is unaffected.
+    if(old_wh != 0 && old_wh != new_wh) {
+        spdlog::info("Freeing stale DLSS resources for shared viewports on resolution change {}x{} -> {}x{}", (uint32_t)(old_wh >> 32), (uint32_t)(old_wh & 0xffffffff),
+                     options.outputWidth, options.outputHeight);
+        static auto free_fn = instance->m_free_resources_hook->get_original<decltype(UpscalerAfrNvidiaModule::on_slFreeResources)>();
+        if(instance->m_enabled->value()) {
+            free_fn(sl::kFeatureDLSS, sl::ViewportHandle{instance->m_afr_viewport_id});
+        }
+        free_fn(sl::kFeatureDLSS, sl::ViewportHandle{0u});
+    }
+
     if(instance->m_enabled->value()) {
         sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
         original_fn(afr_viewport_handle, options);
