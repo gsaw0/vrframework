@@ -1,9 +1,31 @@
 #ifndef STREAMLINE_LEGACY
 #include "UpscalerAfrNvidiaModule.h"
+#include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <vector>
 
 static std::atomic<bool>     s_dlss_options_reset{true};
 static std::atomic<uint64_t> s_dlss_stable_wh{0}; // high32=width, low32=height
+
+static std::atomic<uint64_t> s_shared_viewports{(uint64_t(1024u + 1u) << 32) | 0u}; // low32=stable, high32=afr
+
+struct CachedViewportPair
+{
+    uint64_t     wh;
+    sl::DLSSMode mode;
+    uint64_t     pair;
+};
+static std::mutex                     s_viewport_cache_mutex{};
+static std::vector<CachedViewportPair> s_viewport_pair_cache{}; // guarded by s_viewport_cache_mutex
+static uint32_t                       s_viewport_generation{0}; // guarded by s_viewport_cache_mutex
+
+namespace {
+    constexpr uint32_t kRotatedViewportBase = 0x56520000;
+
+    uint32_t stable_viewport_id() { return (uint32_t)s_shared_viewports.load(std::memory_order_relaxed); }
+    uint32_t afr_viewport_id() { return (uint32_t)(s_shared_viewports.load(std::memory_order_relaxed) >> 32); }
+}
 
 
 #ifdef _DEBUG
@@ -29,6 +51,7 @@ void UpscalerAfrNvidiaModule::on_draw_ui()
     }
 
     m_enabled->draw("Enable NVIDIA AFR");
+    m_free_stale_on_reschange->draw("Free stale DLSS resources on resolution change");
 #ifdef MOTION_VECTOR_REPROJECTION
     m_motion_vector_fix->draw("Motion Vector Reprojection Fix");
 #endif
@@ -209,10 +232,10 @@ sl::Result UpscalerAfrNvidiaModule::on_slSetTag(sl::ViewportHandle& viewport, co
     static auto            original_fn = instance->m_set_tag_hook->get_original<decltype(UpscalerAfrNvidiaModule::on_slSetTag)>();
     static auto            vr          = VR::get();
     if(vr->m_render_frame_count % 2 == 0 && instance->m_enabled->value()) {
-        sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
+        sl::ViewportHandle afr_viewport_handle{afr_viewport_id()};
         return original_fn(afr_viewport_handle, tags, numTags, cmdBuffer);
     }
-    sl::ViewportHandle stable_viewport{0u};
+    sl::ViewportHandle stable_viewport{stable_viewport_id()};
     return original_fn(stable_viewport, tags, numTags, cmdBuffer);
 }
 
@@ -268,8 +291,8 @@ sl::Result UpscalerAfrNvidiaModule::on_slEvaluateFeature(sl::Feature feature, co
 
     if(supported_afr_feature(feature)) {
         sl::ViewportHandle target_viewport = (frame % 2 == 0 && instance->m_enabled->value())
-            ? sl::ViewportHandle{instance->m_afr_viewport_id}
-            : sl::ViewportHandle{0u};
+            ? sl::ViewportHandle{afr_viewport_id()}
+            : sl::ViewportHandle{stable_viewport_id()};
         std::vector<sl::BaseStructure*> remapped_inputs(numInputs);
         for (uint32_t i = 0; i < numInputs; i++) {
             remapped_inputs[i] = (inputs[i]->structType == sl::ViewportHandle::s_structType) ? &target_viewport : inputs[i];
@@ -297,10 +320,10 @@ sl::Result UpscalerAfrNvidiaModule::on_slSetConstants(sl::Constants& values, con
 
 
     if(frame % 2 == 0 && instance->m_enabled->value()) {
-        sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
+        sl::ViewportHandle afr_viewport_handle{afr_viewport_id()};
         return original_fn(values, frame, afr_viewport_handle);
     }
-    sl::ViewportHandle stable_viewport{0u};
+    sl::ViewportHandle stable_viewport{stable_viewport_id()};
     return original_fn(values, frame, stable_viewport);
 }
 
@@ -319,7 +342,7 @@ sl::Result UpscalerAfrNvidiaModule::on_dlssrrSetOptions(const sl::ViewportHandle
     static auto     instance         = UpscalerAfrNvidiaModule::Get();
     static auto     original_fn      = instance->m_dlssrr_set_options_hook->get_original<decltype(UpscalerAfrNvidiaModule::on_dlssrrSetOptions)>();
     if(instance->m_enabled->value()) {
-        sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
+        sl::ViewportHandle afr_viewport_handle{afr_viewport_id()};
         original_fn(afr_viewport_handle, options);
     }
     return original_fn(viewport, options);
@@ -342,27 +365,62 @@ sl::Result UpscalerAfrNvidiaModule::on_dlssSetOptions(const sl::ViewportHandle& 
     }
     spdlog::info("slDLSSSetOptions APPLYING viewport {:x} mode {} output {}x{}", (UINT)viewport, (int)options.mode, options.outputWidth, options.outputHeight);
 
-    // The game reconfigures DLSS to a different output resolution on menu/StarMap transitions, each time
-    // with a fresh viewport handle that we remap onto the shared viewports 0 and m_afr_viewport_id. Because
-    // on_slFreeResources suppresses the game's cleanup for these shared viewports, Streamline would keep the
-    // previous resolution's internal buffers resident -> VRAM accumulates until it overcommits. Release the
-    // stale resources for the shared viewports before reconfiguring at the new resolution. Only runs on an
-    // actual resolution change, so normal gameplay (stable resolution) is unaffected.
-    if(old_wh != 0 && old_wh != new_wh) {
-        spdlog::info("Freeing stale DLSS resources for shared viewports on resolution change {}x{} -> {}x{}", (uint32_t)(old_wh >> 32), (uint32_t)(old_wh & 0xffffffff),
-                     options.outputWidth, options.outputHeight);
-        static auto free_fn = instance->m_free_resources_hook->get_original<decltype(UpscalerAfrNvidiaModule::on_slFreeResources)>();
-        if(instance->m_enabled->value()) {
-            free_fn(sl::kFeatureDLSS, sl::ViewportHandle{instance->m_afr_viewport_id});
+    // The game reconfigures DLSS to a different output resolution on every flat<->VR transition (menus,
+    // terminals, Star Map). Destroying and recreating DLSS features on those transitions leaks ~2 GB per
+    // open/close cycle until VRAM overcommits, no matter how the free is issued (same-handle sync 27.07-
+    // 02.08.2026, same-handle deferred 25.07.2026, fresh-handle retire+redirect 02.08.2026): sl.dlss's
+    // slFreeResources discards the NVSDK_NGX_D3D12_ReleaseFeature result and reports eOk while the
+    // feature's VRAM is never returned, and sl.common's per-viewport resource clones (idToResourceMap)
+    // are only ever recycled on a re-tag of the same viewport id - slFreeResources never reaches
+    // sl.common, so clones of abandoned viewport ids stay resident until game shutdown. The only scheme
+    // that stays flat (proven by 20 leak-free minutes between transitions in the 02.08 session) is to
+    // never destroy anything: cache one shared viewport pair per (resolution, mode), configure it once,
+    // and just switch the published pair on later transitions.
+    if(old_wh != new_wh && instance->m_free_stale_on_reschange->value()) {
+        uint64_t pair;
+        bool     created = false;
+        {
+            std::scoped_lock lock{s_viewport_cache_mutex};
+            auto it = std::find_if(s_viewport_pair_cache.begin(), s_viewport_pair_cache.end(),
+                                   [&](const CachedViewportPair& e) { return e.wh == new_wh && e.mode == options.mode; });
+            if(it != s_viewport_pair_cache.end()) {
+                pair = it->pair;
+            } else {
+                if(old_wh == 0) {
+                    pair = s_shared_viewports.load(std::memory_order_relaxed);
+                } else {
+                    ++s_viewport_generation;
+                    const uint32_t stable_id = kRotatedViewportBase + s_viewport_generation * 2;
+                    pair = (uint64_t(stable_id + 1) << 32) | uint64_t(stable_id);
+                }
+                s_viewport_pair_cache.push_back({new_wh, options.mode, pair});
+                created = true;
+                if(s_viewport_pair_cache.size() > 8) {
+                    spdlog::warn("DLSS viewport pair cache unusually large ({} entries)", s_viewport_pair_cache.size());
+                }
+            }
         }
-        free_fn(sl::kFeatureDLSS, sl::ViewportHandle{0u});
+        if(created) {
+            if(instance->m_enabled->value()) {
+                original_fn(sl::ViewportHandle{(uint32_t)(pair >> 32)}, options);
+            }
+            const auto stable_result = original_fn(sl::ViewportHandle{(uint32_t)pair}, options);
+            s_shared_viewports.store(pair);
+            spdlog::info("Created DLSS shared viewport pair {:x}/{:x} for {}x{} mode {}", (uint32_t)pair, (uint32_t)(pair >> 32), options.outputWidth,
+                         options.outputHeight, (int)options.mode);
+            return stable_result;
+        }
+        s_shared_viewports.store(pair);
+        spdlog::info("Switched to cached DLSS shared viewport pair {:x}/{:x} for {}x{} mode {} (no reconfigure)", (uint32_t)pair, (uint32_t)(pair >> 32),
+                     options.outputWidth, options.outputHeight, (int)options.mode);
+        return sl::Result::eOk;
     }
 
     if(instance->m_enabled->value()) {
-        sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
+        sl::ViewportHandle afr_viewport_handle{afr_viewport_id()};
         original_fn(afr_viewport_handle, options);
     }
-    sl::ViewportHandle stable_viewport{0u};
+    sl::ViewportHandle stable_viewport{stable_viewport_id()};
     return original_fn(stable_viewport, options);
 }
 
@@ -382,12 +440,12 @@ sl::Result UpscalerAfrNvidiaModule::on_slAllocateResources(sl::CommandBuffer* cm
     static auto instance    = UpscalerAfrNvidiaModule::Get();
     static auto original_fn = instance->m_allocate_resources_hook->get_original<decltype(UpscalerAfrNvidiaModule::on_slAllocateResources)>();
     if(supported_afr_feature(feature) && instance->m_enabled->value()) {
-        sl::ViewportHandle afr_viewport_handle{instance->m_afr_viewport_id};
+        sl::ViewportHandle afr_viewport_handle{afr_viewport_id()};
         original_fn(cmdBuffer, feature, afr_viewport_handle);
     }
     spdlog::info("slAllocateResources for feature {:x} viewport {:x}", (UINT)feature, (UINT)viewport);
     if(supported_afr_feature(feature)) {
-        sl::ViewportHandle stable_viewport{0u};
+        sl::ViewportHandle stable_viewport{stable_viewport_id()};
         return original_fn(cmdBuffer, feature, stable_viewport);
     }
     return original_fn(cmdBuffer, feature, viewport);

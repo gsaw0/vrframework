@@ -2,6 +2,7 @@
 #ifndef STREAMLINE_LEGACY
 #include <Mod.hpp>
 #include <DescriptorHeap.h>
+#include <atomic>
 #include <d3d12.h>
 #include <mods/vr/d3d12/ComPtr.hpp>
 #include <mods/vr/d3d12/CommandContext.hpp>
@@ -57,8 +58,6 @@ private:
     std::unique_ptr<FunctionHook> m_dlssrr_set_options_hook{nullptr};
     std::unique_ptr<FunctionHook> m_sl_dvc_set_options_hook{nullptr};
 
-    uint32_t m_afr_viewport_id{1024 + 1};
-
     void ReprojectMotionVectors(const sl::FrameToken& frame, sl::BaseStructure** inputs, uint32_t numInputs, void* cmdBuffer);
 
 //    static sl::Result on_slGetNewFrameToken(sl::FrameToken*& token, const uint32_t* frameIndex = nullptr);
@@ -76,9 +75,11 @@ private:
     // ModValue settings
     const ModToggle::Ptr m_enabled{ ModToggle::create(generate_name("Enabled"), true) };
     const ModToggle::Ptr m_motion_vector_fix{ ModToggle::create(generate_name("MotionVectorFix"), true) };
-    
+    const ModToggle::Ptr m_free_stale_on_reschange{ ModToggle::create(generate_name("FreeStaleOnResChange"), true) };
+
     ValueList m_options{
         *m_enabled,
+        *m_free_stale_on_reschange,
 #ifdef MOTION_VECTOR_REPROJECTION
         *m_motion_vector_fix
 #endif
