@@ -1065,8 +1065,16 @@ void VR::on_wait_rendering(int frame) {
     // only on the left eye interval because we need the right eye
     // to start render work as soon as possible
     if (((frame) % 2) == m_left_eye_interval || is_using_async_aer()) {
+        static int consecutive_timeouts = 0;
         if (WaitForSingleObject(m_present_finished_event, 333) == WAIT_TIMEOUT) {
-//            timed_out = true;
+            ++consecutive_timeouts;
+            if (consecutive_timeouts == 1 || consecutive_timeouts % 10 == 0) {
+                spdlog::warn("[SYNC] on_wait_rendering timed out ({}x consecutive) frame={} fc[engine={},render={},presenter={}]", consecutive_timeouts, frame,
+                             m_engine_frame_count, m_render_frame_count, m_presenter_frame_count);
+            }
+        } else if (consecutive_timeouts > 0) {
+            spdlog::warn("[SYNC] on_wait_rendering recovered after {} consecutive timeouts", consecutive_timeouts);
+            consecutive_timeouts = 0;
         }
         ResetEvent(m_present_finished_event);
     }

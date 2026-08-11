@@ -172,7 +172,7 @@ LONG WINAPI gowvr::global_exception_handler(struct _EXCEPTION_POINTERS* ei) {
     auto dbghelp = LoadLibrary("dbghelp.dll");
 
     if (dbghelp) {
-        const auto final_path = Framework::get_persistent_dir("vrframework_crash.dmp").string();
+        const auto final_path = Framework::get_persistent_dir("vrframework_crash_" + Framework::session_stamp() + ".dmp").string();
 
         spdlog::error("Attempting to write dump to {}", final_path);
 

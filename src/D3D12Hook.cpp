@@ -567,6 +567,9 @@ HRESULT WINAPI D3D12Hook::present(IDXGISwapChain3* swap_chain, UINT sync_interva
 
         if (result != S_OK) {
             spdlog::error("Present failed: {:x}", result);
+            if ((result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET) && d3d12->m_device != nullptr) {
+                spdlog::error("Device removed reason: {:x}", (unsigned)d3d12->m_device->GetDeviceRemovedReason());
+            }
         }
     } else {
         d3d12->m_ignore_next_present = false;

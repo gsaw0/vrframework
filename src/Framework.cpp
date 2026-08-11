@@ -151,7 +151,7 @@ Framework::Framework(HMODULE module)
     {
 
 #if defined(_DEBUG) || defined(ENABLE_FILE_LOGGING)
-    m_logger = spdlog::basic_logger_mt("VRFramework", (get_persistent_dir("vr_log.txt")).string(), true);
+    m_logger = spdlog::basic_logger_mt("VRFramework", (get_persistent_dir("vr_log_" + session_stamp() + ".txt")).string(), true);
 #else
     auto null_sink = std::make_shared<spdlog::sinks::null_sink_mt>();
     m_logger = std::make_shared<spdlog::logger>("null_logger", null_sink);
@@ -969,6 +969,18 @@ void Framework::on_direct_input_keys(const std::array<uint8_t, 256>& keys) {
     }
 
     m_last_keys = keys;*/
+}
+
+const std::string& Framework::session_stamp() {
+    static const std::string stamp = []() {
+        const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::tm tm{};
+        localtime_s(&tm, &now);
+        char buf[32]{};
+        std::strftime(buf, sizeof(buf), "%d%m%Y_%H%M%S", &tm);
+        return std::string(buf);
+    }();
+    return stamp;
 }
 
 std::filesystem::path Framework::get_persistent_dir() {

@@ -98,6 +98,9 @@ public:
         return get_persistent_dir() / dir;
     }
 
+    // Per-launch timestamp (DDMMYYYY_HHMMSS) shared by the session log and crash dump names.
+    static const std::string& session_stamp();
+
     void request_save_config() {
         m_wants_save_config = true;
     }

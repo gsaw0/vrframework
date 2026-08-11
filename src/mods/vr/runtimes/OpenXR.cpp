@@ -1375,8 +1375,15 @@ XrResult OpenXR::begin_frame(int frame) {
 
     this->end_profile("xrBeginFrame");
 
+    static uint32_t consecutive_begin_failures = 0;
     if (result != XR_SUCCESS) {
-        spdlog::error("[VR] xrBeginFrame failed: {}", this->get_result_string(result));
+        ++consecutive_begin_failures;
+        if (consecutive_begin_failures <= 3 || consecutive_begin_failures % 300 == 0) {
+            spdlog::error("[VR] xrBeginFrame failed: {} ({}x consecutive)", this->get_result_string(result), consecutive_begin_failures);
+        }
+    } else if (consecutive_begin_failures > 0) {
+        spdlog::info("[VR] xrBeginFrame recovered after {} consecutive failures", consecutive_begin_failures);
+        consecutive_begin_failures = 0;
     }
 
     if (result == XR_ERROR_CALL_ORDER_INVALID) {
@@ -1501,8 +1508,18 @@ XrResult OpenXR::end_frame(const std::vector<XrCompositionLayerBaseHeader*>& qua
     this->begin_profile();
     auto result = xrEndFrame(this->session, &frame_end_info);
     this->end_profile("xrEndFrame");
+    static uint32_t consecutive_end_failures = 0;
     if (result != XR_SUCCESS) {
-        spdlog::error("[VR] xrEndFrame failed: {}", this->get_result_string(result));
+        ++consecutive_end_failures;
+        if (consecutive_end_failures <= 3 || consecutive_end_failures % 300 == 0) {
+            spdlog::error("[VR] xrEndFrame failed: {} ({}x consecutive)", this->get_result_string(result), consecutive_end_failures);
+        }
+        if (consecutive_end_failures == 300) {
+            spdlog::warn("[VR] OpenXR runtime is persistently rejecting frames - the runtime (e.g. Virtual Desktop Streamer) is likely in a broken state. Restart it and relaunch the game.");
+        }
+    } else if (consecutive_end_failures > 0) {
+        spdlog::info("[VR] xrEndFrame recovered after {} consecutive failures", consecutive_end_failures);
+        consecutive_end_failures = 0;
     }
 
 //    internal_frame_counter++;
